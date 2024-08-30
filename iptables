@@ -179,3 +179,18 @@ start_dpi() {
 # except KeyboardInterrupt:
 #     q.unbind(socket.AF_INET)
 #     q.close() 
+
+#IMPORTANT: This script provides a general firewall configuration. Please review and customize the rules based on your specific network requirements and security policies. Consider the following:
+
+#1. Adjust the allowed ports and services based on your needs.
+
+#2. Customize the security group IP ranges.
+
+#3. Review and modify the GeoIP blocking list and database path.
+
+#4. If using NAT or IP forwarding, uncomment and configure those sections carefully.
+
+#5. For advanced features like Deep Packet Inspection, research third-party Windows security solutions.
+
+#6. Regularly update this script to align with your evolving security requirements.
+
