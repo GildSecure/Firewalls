@@ -1,0 +1,172 @@
+# MS Windows Firewall Configuration Script
+
+# Author: 
+# Date: 
+
+# Ensure the script is run with administrative privileges
+if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+    Write-Error "Please run this script as an Administrator!"
+    Exit 1
+}
+
+# Error handling function
+function Handle-Error {
+    param (
+        [string]$ErrorMessage
+    )
+    Write-Error "Error: $ErrorMessage"
+    # Log error to file
+    $ErrorMessage | Out-File -Append -FilePath "$env:TEMP\FirewallConfigErrors.log"
+}
+
+# Function to create a new firewall rule
+function New-FirewallRule {
+    param (
+        [string]$Name,
+        [string]$DisplayName,
+        [string]$Direction,
+        [string]$Action,
+        [string]$Protocol,
+        [int[]]$LocalPort,
+        [string]$RemoteAddress = "Any"
+    )
+    
+    $params = @{
+        Name = $Name
+        DisplayName = $DisplayName
+        Direction = $Direction
+        Action = $Action
+        Protocol = $Protocol
+        Enabled = "True"
+    }
+    
+    if ($LocalPort) {
+        $params.LocalPort = $LocalPort
+    }
+    
+    if ($RemoteAddress -ne "Any") {
+        $params.RemoteAddress = $RemoteAddress
+    }
+    
+    try {
+        New-NetFirewallRule @params
+    }
+    catch {
+        Handle-Error "Failed to create firewall rule '$Name': $_"
+    }
+}
+
+# Reset Windows Firewall to default settings
+Write-Host "Resetting Windows Firewall to default settings..."
+try {
+    netsh advfirewall reset
+}
+catch {
+    Handle-Error "Failed to reset Windows Firewall: $_"
+    Exit 1
+}
+
+# Set default policies
+try {
+    Set-NetFirewallProfile -Profile Domain,Public,Private -DefaultInboundAction Block -DefaultOutboundAction Allow
+}
+catch {
+    Handle-Error "Failed to set default firewall policies: $_"
+}
+
+# Basic Rules
+New-FirewallRule -Name "AllowLoopback" -DisplayName "Allow Loopback Traffic" -Direction Inbound -Action Allow -Protocol Any -RemoteAddress "127.0.0.1"
+New-FirewallRule -Name "AllowEstablished" -DisplayName "Allow Established Connections" -Direction Inbound -Action Allow -Protocol TCP -RemoteAddress "Any"
+New-FirewallRule -Name "AllowSSH" -DisplayName "Allow SSH" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 22
+New-FirewallRule -Name "AllowHTTP" -DisplayName "Allow HTTP" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 80
+New-FirewallRule -Name "AllowHTTPS" -DisplayName "Allow HTTPS" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 443
+New-FirewallRule -Name "AllowDNS" -DisplayName "Allow DNS" -Direction Inbound -Action Allow -Protocol UDP -LocalPort 53
+New-FirewallRule -Name "AllowDNSTCP" -DisplayName "Allow DNS (TCP)" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 53
+New-FirewallRule -Name "AllowICMP" -DisplayName "Allow ICMP" -Direction Inbound -Action Allow -Protocol ICMPv4
+
+# Rate Limiting for SSH (PowerShell implementation)
+$MaxConnections = 5
+$TimeWindow = 60 # seconds
+
+$SSHRateLimitingScript = {
+    $SSHConnections = Get-NetTCPConnection -LocalPort 22 -State Established
+    if ($SSHConnections.Count -ge $MaxConnections) {
+        New-NetFirewallRule -Name "BlockSSH" -DisplayName "Temporary Block SSH" -Direction Inbound -Action Block -Protocol TCP -LocalPort 22 -RemoteAddress Any
+        Start-Sleep -Seconds $TimeWindow
+        Remove-NetFirewallRule -Name "BlockSSH"
+    }
+}
+
+$Trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Seconds 10)
+$Action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$env:TEMP\SSHRateLimiting.ps1`""
+$SSHRateLimitingScript | Out-File -FilePath "$env:TEMP\SSHRateLimiting.ps1"
+Register-ScheduledTask -TaskName "SSHRateLimiting" -Trigger $Trigger -Action $Action -RunLevel Highest -Force
+
+# GeoIP Blocking (using a third-party GeoIP database)
+# Note: This requires manual setup of a GeoIP database
+$GeoIPBlockList = @("CN", "RU", "KP") # Example: Block China, Russia, North Korea
+$GeoIPDatabase = "C:\Path\To\GeoIP\Database.mmdb" # Update this path
+
+if (Test-Path $GeoIPDatabase) {
+    $GeoIP = [Geo.Ip]::new($GeoIPDatabase)
+    foreach ($CountryCode in $GeoIPBlockList) {
+        $IPRanges = $GeoIP.GetCountryIpRanges($CountryCode)
+        foreach ($Range in $IPRanges) {
+            New-FirewallRule -Name "BlockCountry_$CountryCode" -DisplayName "Block $CountryCode" -Direction Inbound -Action Block -RemoteAddress $Range
+        }
+    }
+}
+else {
+    Write-Warning "GeoIP database not found. Skipping GeoIP blocking."
+}
+
+# Example security groups (customize as needed)
+$WebServers = "192.168.1.0/24"
+$DBServers = "192.168.2.0/24"
+$AppServers = "192.168.3.0/24"
+
+New-FirewallRule -Name "AllowWebServers" -DisplayName "Allow Web Servers" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 80,443 -RemoteAddress $WebServers
+New-FirewallRule -Name "AllowDBServers" -DisplayName "Allow DB Servers" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3306,5432 -RemoteAddress $DBServers
+New-FirewallRule -Name "AllowAppServers" -DisplayName "Allow App Servers" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8080,8000 -RemoteAddress $AppServers
+
+# Enable logging
+Set-NetFirewallProfile -LogBlocked True -LogFileName %SystemRoot%\System32\LogFiles\Firewall\pfirewall.log
+
+# NAT Configuration (if needed)
+# Uncomment and customize the following lines if NAT is required
+# Install-WindowsFeature Routing -IncludeManagementTools
+# Import-Module RemoteAccess
+# Install-RemoteAccess -VpnType Vpn
+# Add-VpnS2SInterface -Name "VPN_Connection" -Destination "VPN_Server_IP" -Protocol IKEv2 -AuthenticationMethod PSKOnly -SharedSecret "YourSharedSecretHere"
+# Enable-NetNatTransitionConfiguration -Name "NAT64"
+
+# IP Forwarding (if needed for routing)
+# Uncomment the following line to enable IP forwarding
+# Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -Name "IPEnableRouter" -Value 1
+
+# Apply changes and restart the firewall service
+try {
+    Restart-Service -Name mpssvc -Force
+    Write-Host "Windows Firewall has been configured with advanced rules and restarted."
+}
+catch {
+    Handle-Error "Failed to restart the Windows Firewall service: $_"
+}
+
+Write-Host "Script execution completed. Please review the rules in Windows Firewall with Advanced Security."
+Write-Host "For Deep Packet Inspection (DPI) capabilities, consider using a third-party security solution."
+
+# PowerShell Remoting example (commented out by default)
+# $RemoteComputers = @("Server1", "Server2", "Server3")
+# Invoke-Command -ComputerName $RemoteComputers -FilePath $MyInvocation.MyCommand.Path
+
+# Customization
+Write-Host "
+IMPORTANT: This script provides a general firewall configuration. Please review and customize the rules based on your specific network requirements and security policies. Consider the following:
+1. Adjust the allowed ports and services based on your needs.
+2. Customize the security group IP ranges.
+3. Review and modify the GeoIP blocking list and database path.
+4. If using NAT or IP forwarding, uncomment and configure those sections carefully.
+5. For advanced features like Deep Packet Inspection, research third-party Windows security solutions.
+6. Regularly update this script to align with your evolving security requirements.
+"
