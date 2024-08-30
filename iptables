@@ -1,0 +1,181 @@
+#!/bin/bash
+
+# iptables Firewall Script with Traffic Shaping and DPI
+
+# Author: ***
+# Date: ***
+
+
+
+# Pre-requisites:
+# 1. Install necessary packages:
+#    sudo apt-get update
+#    sudo apt-get install iptables-persistent xtables-addons-common libxt-geoip-dev libnetfilter-queue-dev python3-nfqueue
+# 2. Download and install GeoIP database:
+#    sudo mkdir /usr/share/xt_geoip
+#    sudo /usr/lib/xtables-addons/xt_geoip_dl
+#    sudo /usr/lib/xtables-addons/xt_geoip_build -D /usr/share/xt_geoip *.csv
+# 3. Create a Python script for DPI (example provided below the main script)
+
+# Load required modules
+modprobe ip_conntrack
+modprobe ip_conntrack_ftp
+modprobe ip_nat_ftp
+modprobe xt_recent
+modprobe xt_conntrack
+modprobe xt_state
+modprobe xt_geoip
+
+# Flush existing rules and set default policies
+iptables -F
+iptables -X
+iptables -t nat -F
+iptables -t nat -X
+iptables -t mangle -F
+iptables -t mangle -X
+
+iptables -P INPUT DROP
+iptables -P FORWARD DROP
+iptables -P OUTPUT ACCEPT
+
+# Allow loopback traffic
+iptables -A INPUT -i lo -j ACCEPT
+iptables -A OUTPUT -o lo -j ACCEPT
+
+# Allow established and related connections
+iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+# Create custom chains
+iptables -N TCP
+iptables -N UDP
+iptables -N LOGGING
+
+# Allow incoming SSH with rate limiting
+iptables -A TCP -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --set
+iptables -A TCP -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --update --seconds 60 --hitcount 4 -j DROP
+iptables -A TCP -p tcp --dport 22 -j ACCEPT
+
+# Allow incoming HTTP and HTTPS
+iptables -A TCP -p tcp -m multiport --dports 80,443 -m conntrack --ctstate NEW -j ACCEPT
+
+# Allow incoming DNS queries
+iptables -A UDP -p udp --dport 53 -j ACCEPT
+iptables -A TCP -p tcp --dport 53 -j ACCEPT
+
+# Allow incoming ICMP (ping)
+iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
+
+# GeoIP-based filtering (adjust countries as needed)
+iptables -A INPUT -m geoip --src-cc CN,RU,KP -j DROP
+
+# Deep Packet Inspection (requires nfqueue)
+iptables -A INPUT -m conntrack --ctstate NEW -j NFQUEUE --queue-num 0
+
+# Implement security groups
+# Web Servers
+iptables -N WEB_SERVERS
+iptables -A WEB_SERVERS -p tcp --dport 80 -j ACCEPT
+iptables -A WEB_SERVERS -p tcp --dport 443 -j ACCEPT
+
+# Database Servers
+iptables -N DB_SERVERS
+iptables -A DB_SERVERS -p tcp --dport 3306 -j ACCEPT  # MySQL
+iptables -A DB_SERVERS -p tcp --dport 5432 -j ACCEPT  # PostgreSQL
+
+# Application Servers
+iptables -N APP_SERVERS
+iptables -A APP_SERVERS -p tcp --dport 8080 -j ACCEPT  # Tomcat
+iptables -A APP_SERVERS -p tcp --dport 8000 -j ACCEPT  # Django
+
+# Apply security groups to specific IP ranges (adjust as needed)
+iptables -A INPUT -s 192.168.1.0/24 -j WEB_SERVERS
+iptables -A INPUT -s 192.168.2.0/24 -j DB_SERVERS
+iptables -A INPUT -s 192.168.3.0/24 -j APP_SERVERS
+
+# Advanced conntrack options
+iptables -A INPUT -p tcp --dport 1024:65535 -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT
+
+# Logging chain
+iptables -A LOGGING -m limit --limit 2/min -j LOG --log-prefix "IPTables-Dropped: " --log-level 4
+iptables -A LOGGING -j DROP
+
+# Send incoming traffic to custom chains
+iptables -A INPUT -p tcp -j TCP
+iptables -A INPUT -p udp -j UDP
+
+# Send unmatched traffic to logging chain
+iptables -A INPUT -j LOGGING
+
+# NAT configuration (uncomment and adjust if needed)
+# iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+
+# Save the rules
+iptables-save > /etc/iptables/rules.v4
+
+# IPv6 rules (basic, expand as needed)
+ip6tables -F
+ip6tables -X
+ip6tables -P INPUT DROP
+ip6tables -P FORWARD DROP
+ip6tables -P OUTPUT ACCEPT
+
+ip6tables -A INPUT -i lo -j ACCEPT
+ip6tables -A OUTPUT -o lo -j ACCEPT
+ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+# Save IPv6 rules
+ip6tables-save > /etc/iptables/rules.v6
+
+# Traffic Shaping with tc (adjust interface and rates as needed)
+tc qdisc add dev eth0 root handle 1: htb default 30
+tc class add dev eth0 parent 1: classid 1:1 htb rate 1gbit burst 15k
+tc class add dev eth0 parent 1:1 classid 1:10 htb rate 500mbit burst 15k
+tc class add dev eth0 parent 1:1 classid 1:20 htb rate 300mbit burst 15k
+tc class add dev eth0 parent 1:1 classid 1:30 htb rate 200mbit burst 15k
+
+# Prioritize VoIP traffic
+tc filter add dev eth0 parent 1: protocol ip prio 1 u32 match ip dport 5060 0xffff flowid 1:10
+
+# Limit bandwidth for BitTorrent traffic
+tc filter add dev eth0 parent 1: protocol ip prio 2 u32 match ip dport 6881 0xffff flowid 1:30
+
+echo "Advanced firewall rules and traffic shaping have been applied and saved."
+
+# Function to start DPI
+start_dpi() {
+    python3 /path/to/your/dpi_script.py &
+}
+
+# Start DPI (uncomment when your DPI script is ready)
+# start_dpi
+
+# Enable IP forwarding (uncomment if needed, e.g., for NAT or routing)
+# echo 1 > /proc/sys/net/ipv4/ip_forward
+
+# Example DPI script (save this as /path/to/your/dpi_script.py):
+# 
+# import nfqueue
+# from scapy.all import IP, TCP
+#
+# def callback(payload):
+#     data = payload.get_data()
+#     pkt = IP(data)
+#     if pkt.haslayer(TCP) and pkt[TCP].dport == 80:
+#         if b"malicious" in str(pkt[TCP].payload).lower():
+#             print("Dropping malicious packet")
+#             payload.set_verdict(nfqueue.NF_DROP)
+#         else:
+#             payload.set_verdict(nfqueue.NF_ACCEPT)
+#     else:
+#         payload.set_verdict(nfqueue.NF_ACCEPT)
+#
+# q = nfqueue.queue()
+# q.open()
+# q.bind(socket.AF_INET)
+# q.set_callback(callback)
+# q.create_queue(0)
+# try:
+#     q.try_run()
+# except KeyboardInterrupt:
+#     q.unbind(socket.AF_INET)
+#     q.close() 
